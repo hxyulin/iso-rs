@@ -15,7 +15,6 @@ pub enum BootCatalogueEntry {
     SectionHeader(BootSectionHeaderEntry),
     SectionEntry(BootSectionEntry),
     SectionEntryExtension(BootSectionEntryExtension),
-    VolumeDescriptor(BootRecordVolumeDescriptor),
 }
 
 impl BootCatalogueEntry {
@@ -26,7 +25,6 @@ impl BootCatalogueEntry {
             BootCatalogueEntry::SectionHeader(entry) => bytemuck::bytes_of(entry),
             BootCatalogueEntry::SectionEntry(entry) => bytemuck::bytes_of(entry),
             BootCatalogueEntry::SectionEntryExtension(entry) => bytemuck::bytes_of(entry),
-            BootCatalogueEntry::VolumeDescriptor(entry) => bytemuck::bytes_of(entry),
         }
     }
 
@@ -37,7 +35,6 @@ impl BootCatalogueEntry {
             BootCatalogueEntry::SectionHeader(_) => size_of::<BootSectionHeaderEntry>(),
             BootCatalogueEntry::SectionEntry(_) => size_of::<BootSectionEntry>(),
             BootCatalogueEntry::SectionEntryExtension(_) => size_of::<BootSectionEntryExtension>(),
-            BootCatalogueEntry::VolumeDescriptor(_) => size_of::<BootRecordVolumeDescriptor>(),
         }
     }
 }
@@ -134,19 +131,3 @@ pub struct BootSectionEntryExtension {
 unsafe impl bytemuck::Zeroable for BootSectionEntryExtension {}
 unsafe impl bytemuck::Pod for BootSectionEntryExtension {}
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct BootRecordVolumeDescriptor {
-    /// Must be set to 0
-    pub boot_record_indicator: u8,
-    /// iso identifier, should be "CD001"
-    pub iso_identifier: IsoStrA<5>,
-    pub version: u8,
-    pub boot_system_identifier: [u8; 32],
-    pub unused0: [u8; 32],
-    pub catalog_ptr: U32<LittleEndian>,
-    pub unused1: [u8; 1973],
-}
-
-unsafe impl bytemuck::Zeroable for BootRecordVolumeDescriptor {}
-unsafe impl bytemuck::Pod for BootRecordVolumeDescriptor {}

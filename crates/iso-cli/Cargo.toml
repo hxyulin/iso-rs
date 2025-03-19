@@ -1,0 +1,8 @@
+[package]
+name = "iso-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap = { version = "4.5.32", features = ["derive"] }
+iso-rs.workspace = true
