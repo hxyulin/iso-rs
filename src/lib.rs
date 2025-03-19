@@ -1,6 +1,15 @@
+use std::{
+    io::{Read, Seek, Write},
+    mem::offset_of,
+};
+
+use boot::{
+    BootCatalogueEntry, BootInitialEntry, BootSectionEntry, BootSectionHeaderEntry,
+    BootValidationEntry, PlatformId,
+};
 use types::{
-    BigEndian, DecDateTime, FileInterchange, Filename, IsoStrA, IsoStrD, LittleEndian, U16LsbMsb,
-    U32, U32LsbMsb,
+    BigEndian, DecDateTime, FileInterchange, Filename, IsoStrA, IsoStrD, LittleEndian, U16,
+    U16LsbMsb, U32, U32LsbMsb,
 };
 
 pub mod boot;
@@ -89,8 +98,8 @@ impl PrimaryVolumeDescriptor {
                 version: 1,
             },
             unused0: 0,
-            system_identifier: IsoStrA::from_str("Example-OS").unwrap(),
-            volume_identifier: IsoStrD::from_str("EXAMPLEOS").unwrap(),
+            system_identifier: IsoStrA::empty(),
+            volume_identifier: IsoStrD::from_str("ISOIMAGE").unwrap(),
             unused1: [0; 8],
             volume_space_size: U32LsbMsb::new(sectors),
             unused2: [0; 32],
@@ -136,13 +145,16 @@ pub struct PathTableEntry<F: FileInterchange> {
 }
 
 /// The header of a directory record, because the identifier is variable length,
-#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DirectoryRecordHeader {
     pub len: u8,
     pub extended_attr_record: u8,
+    /// The LBA of the record
     pub extent: U32LsbMsb,
+    /// The length of the data in bytes
     pub data_len: U32LsbMsb,
-    pub date_time: DecDateTime,
+    pub date_time: DirDateTime,
     pub flags: u8,
     pub file_unit_size: u8,
     pub interleave_gap_size: u8,
@@ -150,8 +162,36 @@ pub struct DirectoryRecordHeader {
     pub file_identifier_len: u8,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DirDateTime {
+struct DirectoryRecord {
+    pub header: DirectoryRecordHeader,
+    pub name: Vec<u8>,
+}
+
+impl DirectoryRecord {
+    pub fn size(&self) -> usize {
+        size_of::<DirectoryRecordHeader>() + self.name.len()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(bytemuck::bytes_of(&self.header));
+        bytes.extend_from_slice(&self.name);
+        bytes
+    }
+}
+
+/// The root directory entry
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RootDirectoryEntry {
+    pub header: DirectoryRecordHeader,
+    /// There is no name on the root directory, so this is always empty
+    pub padding: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DirDateTime {
     /// Number of years since 1900
     year: u8,
     month: u8,
@@ -160,6 +200,20 @@ struct DirDateTime {
     minute: u8,
     second: u8,
     offset: u8,
+}
+
+impl Default for DirDateTime {
+    fn default() -> Self {
+        Self {
+            year: 0,
+            month: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            offset: 0,
+        }
+    }
 }
 
 bitflags::bitflags! {
@@ -173,57 +227,210 @@ bitflags::bitflags! {
     }
 }
 
+pub struct IsoFile {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
 pub struct FormatOptions {
     el_torito: Option<ElToritoOptions>,
+    files: Vec<IsoFile>,
 }
 
 pub struct ElToritoOptions {
     // Emulating is not supported
-    load_size: u32,
+    load_size: u16,
+    boot_image: Option<Vec<u8>>,
 }
 
-pub struct IsoImage {
-    // TODO: We make a this Read Write trait instead of in memory Vec
-    pub data: Vec<u8>,
-    pub cur_sector: usize,
+pub trait ReadWriteSeek: Read + Write + Seek {}
+impl<T: Read + Write + Seek> ReadWriteSeek for T {}
+
+fn to_sectors_ceil(size: usize) -> usize {
+    (size + 2047) / 2048
 }
 
-impl IsoImage {
-    pub fn format_new(size: usize, ops: FormatOptions) -> Self {
-        assert!(size % 2048 == 0, "Size must be a multiple of 2048");
-        assert!(size >= 16 * 2048, "Size must be at least 16 sectors");
-        let mut image = Self {
-            data: vec![0; size],
-            cur_sector: 17,
-        };
+pub struct IsoImage<'a, T: ReadWriteSeek> {
+    pub data: &'a mut T,
+    pub size: usize,
+}
 
-        *image.pvd() = PrimaryVolumeDescriptor::new((size / 2048) as u32);
+impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
+    pub fn format_new(data: &'a mut T, ops: FormatOptions) -> Result<Self, std::io::Error> {
+        let size = data.seek(std::io::SeekFrom::End(0)).unwrap() as usize;
+        assert!(
+            size % 2048 == 0,
+            "Size must be a multiple of 2048, got {}",
+            size
+        );
+
+        let mut image = Self { data, size };
+
+        // We start at 20 to avoid the reserved area
+        image
+            .data
+            .seek(std::io::SeekFrom::Start(20 * 2048))
+            .unwrap();
+
+        let mut pvd = PrimaryVolumeDescriptor::new((size / 2048) as u32);
+
+        let mut boot_catalogue: Vec<BootCatalogueEntry> = Vec::new();
+
         if let Some(el_torito) = ops.el_torito {
             use types::Endian;
+
+            let boot_code = if let Some(boot_image) = &el_torito.boot_image {
+                // FIXME: El-Torito is complaiining about the boot catalogue if we have a boot
+                // image, so there is some logic bug here
+                let sector = image.current_sector();
+                image.data.write_all(&boot_image)?;
+                Some((sector, to_sectors_ceil(boot_image.len()) as u32))
+            } else {
+                None
+            };
+
+            image.align()?;
+
             let brvd = boot::BootRecordVolumeDescriptor {
                 boot_record_indicator: 0,
                 iso_identifier: IsoStrA::from_str("CD001").unwrap(),
                 version: 1,
                 boot_system_identifier: *b"EL TORITO SPECIFICATION\0\0\0\0\0\0\0\0\0",
                 unused0: [0; 32],
-                catalog_ptr: U32::<LittleEndian>::new(0),
-                unused1: [0; 1972],
+                // Catalog is after the boot code
+                catalog_ptr: U32::<LittleEndian>::new(image.current_sector() as u32),
+                unused1: [0; 1973],
             };
-            // TODO: We need to write boot catalogue, and then come back and write the volume descriptor becaue we need the pointer (relative to the start of the image) to the boot catalogue.
-            unimplemented!()
+            boot_catalogue.push(BootCatalogueEntry::VolumeDescriptor(brvd));
+
+            let mut validation_entry = BootValidationEntry {
+                header_id: 0x01,
+                platform_id: boot::PlatformId::X80X86 as u8,
+                reserved: [0; 2],
+                manufacturer: [0; 24],
+                checksum: U16::<LittleEndian>::new(0),
+                key: [0x55, 0xAA],
+            };
+            validation_entry
+                .checksum
+                .set(validation_entry.calculate_checksum());
+            boot_catalogue.push(BootCatalogueEntry::Validation(validation_entry));
+            // Default entry is UEFI
+            let default_entry = BootInitialEntry {
+                boot_indicator: 0x88,
+                boot_media_type: 0x00,
+                load_segment: U16::<LittleEndian>::new(0),
+                system_type: 0x00,
+                reserved0: 0x00,
+                sector_count: U16::<LittleEndian>::new(el_torito.load_size),
+                load_rba: U32::<LittleEndian>::new(0),
+                reserved1: [0; 20],
+            };
+            boot_catalogue.push(BootCatalogueEntry::Initial(default_entry));
+            if let Some((lba, size)) = boot_code {
+                // Section for BIOS Boot
+                let section_header = BootSectionHeaderEntry {
+                    header_type: 0x91,
+                    platform_id: PlatformId::UEFI as u8,
+                    section_count: U16::<LittleEndian>::new(1),
+                    section_ident: [0u8; 27],
+                };
+                boot_catalogue.push(BootCatalogueEntry::SectionHeader(section_header));
+                let section = BootSectionEntry {
+                    boot_indicator: 0x88,
+                    boot_media_type: 0x00,
+                    load_segment: U16::<LittleEndian>::new(0),
+                    system_type: 0x00,
+                    reserved0: 0x00,
+                    sector_count: U16::<LittleEndian>::new(size as u16),
+                    load_rba: U32::<LittleEndian>::new(lba as u32),
+                    selection_criteria: 0x00,
+                    vendor_unique: [0; 19],
+                };
+                boot_catalogue.push(BootCatalogueEntry::SectionEntry(section));
+                for entry in boot_catalogue.iter() {
+                    image.data.write_all(entry.as_bytes())?;
+                }
+            }
         }
 
-        image
+        image.align()?;
+        // TODO: Support nested directories
+        let mut file_entries: Vec<DirectoryRecord> = Vec::new();
+        let total_size = file_entries.iter().map(|r| r.size()).sum::<usize>();
+        for file in ops.files {
+            // TODO: Create the files and append to the file_entries
+            // and then Write the file
+            // At the same time we populate the path table
+        }
+
+        // Now we do a second pass to write the file entries
+
+        image.align()?;
+
+        let root_dir_entry = RootDirectoryEntry {
+            header: DirectoryRecordHeader {
+                len: size_of::<RootDirectoryEntry>() as u8 + 1,
+                extended_attr_record: 0,
+                extent: U32LsbMsb::new(image.current_sector() as u32),
+                data_len: U32LsbMsb::new(total_size as u32),
+                date_time: DirDateTime::default(),
+                flags: 0,
+                file_unit_size: 0,
+                interleave_gap_size: 0,
+                volume_sequence_number: U16LsbMsb::new(0),
+                file_identifier_len: 0,
+            },
+            padding: 0,
+        };
+        pvd.dir_record
+            .copy_from_slice(bytemuck::bytes_of(&root_dir_entry));
+
+        // Now we can write the directory records
+        for entry in file_entries {
+            image.data.write_all(&entry.to_bytes())?;
+        }
+
+        // And we write the end record
+        let end_record = DirectoryRecordHeader {
+            len: 0,
+            extended_attr_record: 0,
+            extent: U32LsbMsb::new(0),
+            data_len: U32LsbMsb::new(0),
+            date_time: DirDateTime::default(),
+            flags: 0,
+            file_unit_size: 0,
+            interleave_gap_size: 0,
+            volume_sequence_number: U16LsbMsb::new(0),
+            file_identifier_len: 0,
+        };
+        image.data.write_all(bytemuck::bytes_of(&end_record))?;
+
+        // Now we can write everything at the end
+        image.data.seek(std::io::SeekFrom::Start(16 * 2048))?;
+        image.data.write_all(bytemuck::bytes_of(&pvd))?;
+
+        Ok(image)
     }
 
-    pub fn pvd(&mut self) -> &mut PrimaryVolumeDescriptor {
-        let offset = 16 * 2048;
-        bytemuck::from_bytes_mut(&mut self.data[offset..offset + 2048])
+    fn current_sector(&mut self) -> usize {
+        let seek = self.data.seek(std::io::SeekFrom::Current(0)).unwrap();
+        assert!(seek % 2048 == 0, "Seek must be a multiple of 2048");
+        (seek / 2048) as usize
+    }
+
+    fn align(&mut self) -> Result<u64, std::io::Error> {
+        let current_seek = self.data.seek(std::io::SeekFrom::Current(0))?;
+        let padded_end = (current_seek + 2047) & !2047;
+        self.data.seek(std::io::SeekFrom::Start(padded_end))?;
+        Ok(padded_end)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     #[test]
@@ -234,7 +441,29 @@ mod tests {
 
     #[test]
     fn test_new_image() {
-        let image = IsoImage::format_new(1024 * 2048);
-        std::fs::write("test.iso", &image.data).unwrap();
+        let options = FormatOptions {
+            el_torito: Some(ElToritoOptions {
+                load_size: 4,
+                boot_image: None,
+            }),
+            files: Vec::new(),
+        };
+        let mut data = Cursor::new(vec![0; 1024 * 2048]);
+        let image = IsoImage::format_new(&mut data, options);
+        drop(image);
+        data.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open("test.iso")
+            .unwrap();
+        let mut buffer = [0u8; 32768];
+        loop {
+            let read = data.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read]).unwrap();
+        }
     }
 }

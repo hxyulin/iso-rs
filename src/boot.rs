@@ -8,6 +8,40 @@ use crate::types::{IsoStrA, LittleEndian, U16, U32};
 /// Section entries,
 /// Section entry extensions
 
+#[derive(Debug, Clone, Copy)]
+pub enum BootCatalogueEntry {
+    Validation(BootValidationEntry),
+    Initial(BootInitialEntry),
+    SectionHeader(BootSectionHeaderEntry),
+    SectionEntry(BootSectionEntry),
+    SectionEntryExtension(BootSectionEntryExtension),
+    VolumeDescriptor(BootRecordVolumeDescriptor),
+}
+
+impl BootCatalogueEntry {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            BootCatalogueEntry::Validation(entry) => bytemuck::bytes_of(entry),
+            BootCatalogueEntry::Initial(entry) => bytemuck::bytes_of(entry),
+            BootCatalogueEntry::SectionHeader(entry) => bytemuck::bytes_of(entry),
+            BootCatalogueEntry::SectionEntry(entry) => bytemuck::bytes_of(entry),
+            BootCatalogueEntry::SectionEntryExtension(entry) => bytemuck::bytes_of(entry),
+            BootCatalogueEntry::VolumeDescriptor(entry) => bytemuck::bytes_of(entry),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match self {
+            BootCatalogueEntry::Validation(_) => size_of::<BootValidationEntry>(),
+            BootCatalogueEntry::Initial(_) => size_of::<BootInitialEntry>(),
+            BootCatalogueEntry::SectionHeader(_) => size_of::<BootSectionHeaderEntry>(),
+            BootCatalogueEntry::SectionEntry(_) => size_of::<BootSectionEntry>(),
+            BootCatalogueEntry::SectionEntryExtension(_) => size_of::<BootSectionEntryExtension>(),
+            BootCatalogueEntry::VolumeDescriptor(_) => size_of::<BootRecordVolumeDescriptor>(),
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum PlatformId {
@@ -15,9 +49,11 @@ pub enum PlatformId {
     X80X86 = 0x00,
     PowerPC = 0x01,
     Macintosh = 0x02,
+    UEFI = 0xEF,
 }
+
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct BootValidationEntry {
     pub header_id: u8,
     pub platform_id: u8,
@@ -28,8 +64,20 @@ pub struct BootValidationEntry {
     pub key: [u8; 2],
 }
 
+impl BootValidationEntry {
+    pub fn calculate_checksum(&self) -> u16 {
+        let bytes = bytemuck::bytes_of(self);
+        let mut checksum = 0u16;
+        for i in (0..32).step_by(2) {
+            let value = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+            checksum = checksum.wrapping_add(value);
+        }
+        u16::MAX - checksum + 1
+    }
+}
+
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct BootInitialEntry {
     pub boot_indicator: u8,
     pub boot_media_type: u8,
@@ -52,6 +100,9 @@ pub struct BootSectionHeaderEntry {
     pub section_ident: [u8; 27],
 }
 
+unsafe impl bytemuck::Zeroable for BootSectionHeaderEntry {}
+unsafe impl bytemuck::Pod for BootSectionHeaderEntry {}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BootSectionEntry {
@@ -67,6 +118,9 @@ pub struct BootSectionEntry {
     pub vendor_unique: [u8; 19],
 }
 
+unsafe impl bytemuck::Zeroable for BootSectionEntry {}
+unsafe impl bytemuck::Pod for BootSectionEntry {}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BootSectionEntryExtension {
@@ -76,6 +130,9 @@ pub struct BootSectionEntryExtension {
     pub flags: u8,
     pub vendor_unique: [u8; 30],
 }
+
+unsafe impl bytemuck::Zeroable for BootSectionEntryExtension {}
+unsafe impl bytemuck::Pod for BootSectionEntryExtension {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -88,5 +145,8 @@ pub struct BootRecordVolumeDescriptor {
     pub boot_system_identifier: [u8; 32],
     pub unused0: [u8; 32],
     pub catalog_ptr: U32<LittleEndian>,
-    pub unused1: [u8; 1972],
+    pub unused1: [u8; 1973],
 }
+
+unsafe impl bytemuck::Zeroable for BootRecordVolumeDescriptor {}
+unsafe impl bytemuck::Pod for BootRecordVolumeDescriptor {}
