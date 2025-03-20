@@ -1,4 +1,8 @@
-use std::{ffi::CStr, fmt::Debug, io::{Read, Write}};
+use std::{
+    ffi::CStr,
+    fmt::Debug,
+    io::{Read, Write},
+};
 
 use crate::{
     directory::RootDirectoryEntry,
@@ -149,6 +153,22 @@ impl VolumeDescriptorList {
                 _ => None,
             })
             .expect("Primary volume descriptor not found")
+    }
+
+    pub fn boot_record(&self) -> Option<&BootRecordVolumeDescriptor> {
+        self.descriptors.iter().find_map(|d| match d {
+            VolumeDescriptor::BootRecord(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    pub fn boot_record_mut(&mut self) -> Option<&mut BootRecordVolumeDescriptor> {
+        self.descriptors
+            .iter_mut()
+            .find_map(|d| match d {
+                VolumeDescriptor::BootRecord(d) => Some(d),
+                _ => None,
+            })
     }
 
     pub fn push(&mut self, descriptor: VolumeDescriptor) {
@@ -353,6 +373,19 @@ pub struct BootRecordVolumeDescriptor {
     pub unused0: [u8; 32],
     pub catalog_ptr: U32<LittleEndian>,
     pub unused1: [u8; 1973],
+}
+
+impl BootRecordVolumeDescriptor {
+    pub fn new(catalog_sector: u32) -> Self {
+        const BOOT_SYSTEM_IDENTIFIER: [u8; 32] = *b"EL TORITO SPECIFICATION\0\0\0\0\0\0\0\0\0";
+        Self {
+            header: VolumeDescriptorHeader::new(VolumeDescriptorType::BootRecord),
+            boot_system_identifier: BOOT_SYSTEM_IDENTIFIER,
+            unused0: [0; 32],
+            catalog_ptr: U32::<LittleEndian>::new(catalog_sector),
+            unused1: [0; 1973],
+        }
+    }
 }
 
 impl Debug for BootRecordVolumeDescriptor {

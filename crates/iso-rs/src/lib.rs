@@ -1,13 +1,17 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     fmt::Debug,
     io::{Read, Seek, SeekFrom, Write},
+    path::PathBuf,
 };
 
+use boot::{BootCatalogue, BootInfoTable};
 use directory::{DirectoryRecord, DirectoryRecordHeader, DirectoryRef, FileFlags};
 use path::PathTableEntry;
-use types::{Endian, IsoStringFile};
-use volume::{PrimaryVolumeDescriptor, VolumeDescriptor, VolumeDescriptorList};
+use types::{Endian, IsoStringFile, LittleEndian, U16, U32};
+use volume::{
+    BootRecordVolumeDescriptor, PrimaryVolumeDescriptor, VolumeDescriptor, VolumeDescriptorList,
+};
 
 pub mod boot;
 pub mod directory;
@@ -52,19 +56,70 @@ impl IsoFile {
             Self::File { name, .. } => *name = new_name,
         }
     }
+
+    // TODO: We should probably use some sort of trait for paths, since we are doing a lot of
+    // repeated work here, stripping paths, and then we add it back later in the ISO creation
+    pub fn parse_fs(root: PathBuf) -> Result<IsoFile, std::io::Error> {
+        assert!(root.is_dir());
+        let entries = std::fs::read_dir(&root)?;
+        let mut files = Vec::new();
+        for entry in entries {
+            files.push(Self::parse_fs_recursive(&entry?.path(), &root)?);
+        }
+        Ok(Self::Directory {
+            name: "".to_string(),
+            entries: files,
+        })
+    }
+
+    fn parse_fs_recursive(file: &PathBuf, root: &PathBuf) -> Result<IsoFile, std::io::Error> {
+        if file.is_dir() {
+            let entries = std::fs::read_dir(file)?;
+            let mut files = Vec::new();
+            for entry in entries {
+                files.push(Self::parse_fs_recursive(&entry?.path(), file)?);
+            }
+            Ok(Self::Directory {
+                name: file
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                entries: files,
+            })
+        } else {
+            Ok(Self::File {
+                name: file
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                data: std::fs::read(file)?,
+            })
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct FormatOptions {
-    //el_torito: Option<ElToritoOptions>,
     pub files: Vec<IsoFile>,
+    pub el_torito: Option<ElToritoOptions>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ElToritoOptions {
     // Emulating is not supported
-    load_size: u16,
-    boot_image: Option<Vec<u8>>,
+    pub load_size: u16,
+    // The path to the boot image,
+    // Currently on root directory is supported
+    pub boot_image_path: String,
+    /// The boot image, which is the contents of the boot sector
+    pub boot_image: Vec<u8>,
+    /// Whether to write the boot info table, for bootloaders like:
+    /// GRUB, LIMINE, SYSLINUX
+    pub boot_info_table: bool,
 }
 
 pub trait ReadWriteSeek: Read + Write + Seek {}
@@ -213,7 +268,7 @@ impl<'a, T: ReadWriteSeek> IsoDirectory<'a, T> {
 }
 
 impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
-    pub fn format_new(data: &'a mut T, ops: FormatOptions) -> Result<(), std::io::Error> {
+    pub fn format_new(data: &'a mut T, mut ops: FormatOptions) -> Result<(), std::io::Error> {
         let size_bytes = data.seek(SeekFrom::End(0))?;
         let size_sectors = size_bytes / 2048;
 
@@ -223,22 +278,87 @@ impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
             size_sectors as u32,
         )));
 
+        if let Some(el_torito) = &ops.el_torito {
+            volume_descriptors.push(VolumeDescriptor::BootRecord(
+                BootRecordVolumeDescriptor::new(0),
+            ));
+            ops.files.push(IsoFile::File {
+                name: el_torito.boot_image_path.clone(),
+                data: el_torito.boot_image.clone(),
+            });
+        }
+
         let mut current_index: u64 = 16 * 2048;
         current_index += volume_descriptors.size_required() as u64;
-        let pvd = volume_descriptors.primary_mut();
-
-        // Now we write all the files
         data.seek(SeekFrom::Start(current_index as u64))?;
 
         let mut file_writer = FileWriter::new(data, ops.files);
         let (root_dir, path_table) = file_writer.write()?;
 
-        pvd.dir_record.header.extent.write(root_dir.offset as u32);
-        pvd.dir_record.header.data_len.write(root_dir.size as u32);
-        pvd.path_table_size.write(path_table.size as u32);
-        pvd.type_l_path_table.set(path_table.offset as u32);
-        pvd.type_m_path_table
-            .set(path_table.offset as u32 + (path_table.size / 2048) as u32);
+        {
+            let pvd = volume_descriptors.primary_mut();
+            pvd.dir_record.header.extent.write(root_dir.offset as u32);
+            pvd.dir_record.header.data_len.write(root_dir.size as u32);
+            pvd.path_table_size.write(path_table.size as u32);
+            pvd.type_l_path_table.set(path_table.offset as u32);
+            pvd.type_m_path_table
+                .set(path_table.offset as u32 + (path_table.size / 2048) as u32);
+        }
+
+        if let Some(mut ops) = ops.el_torito {
+            // TODO: If we support nested files, we need to find them from the Path table, and not
+            // the root directory
+            let mut root_dir = IsoDirectory {
+                reader: data,
+                directory: root_dir.clone(),
+            };
+            let (_idx, file) = root_dir
+                .entries()?
+                .iter()
+                .find(|(_idx, e)| e.name.to_str() == ops.boot_image_path.as_str())
+                .expect("Could not find the boot image path in ISO filesystem")
+                .clone();
+
+            let current_index = Self::align(data)?;
+
+            let boot_image_lba = file.header.extent.read();
+
+            if ops.boot_info_table {
+                let byte_offset = boot_image_lba * 2048;
+                let table = BootInfoTable {
+                    iso_start: U32::new(16),
+                    boot_device_number: U16::new(0),
+                    boot_media_type: U16::new(0),
+                    boot_image_lba: U32::new(boot_image_lba),
+                    total_sectors: U32::new(size_sectors as u32),
+                    boot_file_offset: U32::new(boot_image_lba * 2048),
+                    boot_file_size: U32::new(byte_offset),
+                };
+
+                const TABLE_OFFSET: u64 = 8;
+                data.seek(SeekFrom::Start(byte_offset as u64 + TABLE_OFFSET))?;
+                data.write_all(bytemuck::bytes_of(&table))?;
+
+                // We need to seek to the file to update the boot info table
+                data.seek(SeekFrom::Start(current_index))?;
+            }
+
+            let catalogue_start = Self::align(data)? / 2048;
+            volume_descriptors
+                .boot_record_mut()
+                .unwrap()
+                .catalog_ptr
+                .set(catalogue_start as u32);
+            // TODO: Allow specification of segment
+            let catalogue = BootCatalogue::new(
+                boot::MediaType::NoEmulation,
+                0x00,
+                ops.load_size,
+                boot_image_lba,
+            );
+            catalogue.write(data)?;
+        }
+        Self::align(data)?;
 
         data.seek(SeekFrom::Start(16 * 2048))?;
         volume_descriptors.write(data)?;
@@ -252,6 +372,12 @@ impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
         let size = data.seek(SeekFrom::End(0))?;
 
         let pvd = volume_descriptors.primary();
+        if let Some(boot) = volume_descriptors.boot_record() {
+            data.seek(SeekFrom::Start(boot.catalog_ptr.get() as u64 * 2048))?;
+            let _catalogue = BootCatalogue::parse(data)?;
+            // At the moment we dont support anything with a boot catalogue
+        }
+
         let root_entry = pvd.dir_record;
         let root_directory = DirectoryRef {
             offset: root_entry.header.extent.read() as u64,
@@ -544,6 +670,63 @@ impl<'a, W: ReadWriteSeek> FileWriter<'a, W> {
                 }
                 files.push(IsoFile::File { name: path, data });
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_fs() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path();
+        let boot_dir = root_path.join("BOOT/GRUB");
+        let efi_dir = root_path.join("EFI");
+        std::fs::create_dir_all(&boot_dir).unwrap();
+        std::fs::create_dir_all(&efi_dir).unwrap();
+        let grub_cfg = boot_dir.join("grub.cfg");
+        std::fs::write(&grub_cfg, "test").unwrap();
+        let efi_cfg = efi_dir.join("BOOTX64.efi");
+        std::fs::write(&efi_cfg, "test2").unwrap();
+
+        let fs = IsoFile::parse_fs(root.into_path()).unwrap();
+        match fs {
+            IsoFile::Directory { name: _, entries } => {
+                assert_eq!(entries.len(), 2);
+                let boot_entry = entries.iter().find(|e| e.name() == "BOOT").unwrap();
+                let grub_entry = match boot_entry {
+                    IsoFile::Directory { name: _, entries } => {
+                        entries.iter().find(|e| e.name() == "GRUB").unwrap()
+                    }
+                    _ => panic!("unexpected fs type"),
+                };
+                let grub_cfg = match grub_entry {
+                    IsoFile::Directory { name: _, entries } => {
+                        entries.iter().find(|e| e.name() == "grub.cfg").unwrap()
+                    }
+                    _ => panic!("unexpected fs type"),
+                };
+                let data = match grub_cfg {
+                    IsoFile::File { name: _, data } => data,
+                    _ => panic!("unexpected fs type"),
+                };
+                assert_eq!(data, b"test");
+                let efi_entry = entries.iter().find(|e| e.name() == "EFI").unwrap();
+                let efi_boot = match efi_entry {
+                    IsoFile::Directory { name: _, entries } => {
+                        entries.iter().find(|e| e.name() == "BOOTX64.efi").unwrap()
+                    }
+                    _ => panic!("unexpected fs type"),
+                };
+                let efi_data = match efi_boot {
+                    IsoFile::File { name: _, data } => data,
+                    _ => panic!("unexpected fs type"),
+                };
+                assert_eq!(efi_data, b"test2");
+            }
+            _ => panic!("unexpected fs type"),
         }
     }
 }

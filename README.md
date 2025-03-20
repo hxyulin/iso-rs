@@ -22,9 +22,9 @@ This project also contains the specification for the ISO-9660 filesystem, which 
     - [x] Support for writing to the path table
     - [x] Support for writing directories
     - [x] Support for writing files in non-root directories
-- [ ] Support for El Torito booting
-   - [ ] Support for parsing El Torito Boot Records
-   - [ ] Support for loading Boot files
+- [x] Support for El Torito booting
+   - [x] Support for parsing El Torito Boot Records
+   - [x] Support for loading Boot files
 - [ ] Testing   
     - [ ] Tests for reading basic structures
     - [ ] Tests for writing basic structures
