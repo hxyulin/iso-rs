@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Write;
 
 use crate::types::{IsoStringFile, U16LsbMsb, U32LsbMsb};
 
@@ -45,6 +45,10 @@ impl DirectoryRecordHeader {
     pub fn to_bytes(&self) -> &[u8] {
         bytemuck::bytes_of(self)
     }
+
+    pub fn is_directory(&self) -> bool {
+        FileFlags::from_bits_retain(self.flags).contains(FileFlags::DIRECTORY)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,19 +69,19 @@ impl DirectoryRecord {
         bytes
     }
 
-    pub fn directory(name: &[u8]) -> Self {
+    pub fn directory(name: &[u8], dir_ref: DirectoryRef) -> Self {
         Self {
             header: DirectoryRecordHeader {
                 len: ((size_of::<DirectoryRecordHeader>() + name.len() + 1) & !1) as u8,
                 extended_attr_record: 0,
-                extent: U32LsbMsb::new(0),
-                data_len: U32LsbMsb::new(0),
+                extent: U32LsbMsb::new(dir_ref.offset as u32),
+                data_len: U32LsbMsb::new(dir_ref.size as u32),
                 date_time: DirDateTime::default(),
                 flags: FileFlags::DIRECTORY.bits(),
                 file_unit_size: 0,
                 interleave_gap_size: 0,
                 volume_sequence_number: U16LsbMsb::new(1),
-                file_identifier_len: 1,
+                file_identifier_len: name.len() as u8,
             },
             name: IsoStringFile::from_bytes(name),
         }
@@ -152,21 +156,10 @@ impl Default for DirDateTime {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct DirectoryRef {
     pub offset: u64,
     pub size: u64,
-}
-
-#[derive(Debug)]
-pub struct Directory {
-    entries: Vec<DirectoryRecord>,
-}
-
-impl Directory {
-    pub fn parse<T: Read>(reader: &mut T, size: usize) -> Result<Self, std::io::Error> {
-        todo!()
-    }
 }
 
 bitflags::bitflags! {

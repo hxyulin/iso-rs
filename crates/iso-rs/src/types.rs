@@ -98,6 +98,13 @@ impl<C: Charset, const N: usize> IsoStr<C, N> {
     }
 
     pub fn to_str(&self) -> &str {
+        if self.chars.len() == 1 {
+            match self.chars[0] {
+                b'\x00' => return "\\x00",
+                b'\x01' => return "\\x01",
+                _ => {}
+            }
+        }
         // SAFETY: The string is constructed from valid ASCII characters.
         unsafe { core::str::from_utf8_unchecked(&self.chars[..self.len()]) }
     }
@@ -155,6 +162,13 @@ impl<C: Charset> IsoString<C> {
     }
 
     pub fn to_str(&self) -> &str {
+        if self.chars.len() == 1 {
+            match self.chars[0] {
+                b'\x00' => return "\\x00",
+                b'\x01' => return "\\x01",
+                _ => {}
+            }
+        }
         // SAFETY: The string is constructed from valid ASCII characters.
         unsafe { core::str::from_utf8_unchecked(&self.chars[..self.len()]) }
     }
@@ -214,9 +228,51 @@ pub type FilenameL1 = Filename<InterchangeL1>;
 // Endian types copied from https://github.com/hxyulin/hadris
 
 pub enum EndianType {
-    AnyEndian,
+    NativeEndian,
     LittleEndian,
     BigEndian,
+}
+
+impl EndianType {
+    pub fn read_u16(&self, bytes: [u8; 2]) -> u16 {
+        match self {
+            EndianType::NativeEndian => u16::from_ne_bytes(bytes),
+            EndianType::LittleEndian => u16::from_le_bytes(bytes),
+            EndianType::BigEndian => u16::from_be_bytes(bytes),
+        }
+    }
+
+    pub fn read_u32(&self, bytes: [u8; 4]) -> u32 {
+        match self {
+            EndianType::NativeEndian => u32::from_ne_bytes(bytes),
+            EndianType::LittleEndian => u32::from_le_bytes(bytes),
+            EndianType::BigEndian => u32::from_be_bytes(bytes),
+        }
+    }
+
+    pub fn write_u32(&self, value: u32, bytes: &mut [u8; 4]) {
+        match self {
+            EndianType::NativeEndian => bytes.copy_from_slice(&value.to_ne_bytes()),
+            EndianType::LittleEndian => bytes.copy_from_slice(&value.to_le_bytes()),
+            EndianType::BigEndian => bytes.copy_from_slice(&value.to_be_bytes()),
+        }
+    }
+
+    pub fn u16_bytes(&self, value: u16) -> [u8; 2] {
+        match self {
+            EndianType::NativeEndian => value.to_ne_bytes(),
+            EndianType::LittleEndian => value.to_le_bytes(),
+            EndianType::BigEndian => value.to_be_bytes(),
+        }
+    }
+
+    pub fn u32_bytes(&self, value: u32) -> [u8; 4] {
+        match self {
+            EndianType::NativeEndian => value.to_ne_bytes(),
+            EndianType::LittleEndian => value.to_le_bytes(),
+            EndianType::BigEndian => value.to_be_bytes(),
+        }
+    }
 }
 
 pub trait Endianness: Copy {
@@ -243,7 +299,7 @@ pub struct BigEndian;
 impl Endianness for NativeEndian {
     #[inline]
     fn get() -> EndianType {
-        EndianType::AnyEndian
+        EndianType::NativeEndian
     }
 
     #[inline]

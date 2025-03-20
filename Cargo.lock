@@ -226,15 +226,15 @@ checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 
 [[package]]
 name = "iso-cli"
-version = "0.1.0"
+version = "0.0.1-alpha"
 dependencies = [
  "clap",
- "iso-rs",
+ "iso9660-rs",
 ]
 
 [[package]]
-name = "iso-rs"
-version = "0.1.0"
+name = "iso9660-rs"
+version = "0.0.1-alpha"
 dependencies = [
  "bitflags",
  "bytemuck",

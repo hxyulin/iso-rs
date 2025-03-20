@@ -4,8 +4,15 @@ members = ["crates/iso-cli", "crates/iso-rs"]
 default-members = ["crates/iso-cli", "crates/iso-rs"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1-alpha"
 edition = "2024"
+authors = ["hxyulin"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/hxyulin/iso-rs"
+description = "A rust implementation of the ISO-9660 filesystem."
+keywords = ["el-torito", "iso", "iso9660", "cd", "dvd"]
+categories = ["filesystem", "encoding"]
 
 [workspace.dependencies]
-iso-rs = { path = "crates/iso-rs", version = "0.1.0" }
+iso9660-rs = { path = "crates/iso-rs", version = "0.0.1-alpha" }
