@@ -69,7 +69,7 @@ impl DirectoryRecord {
         bytes
     }
 
-    pub fn directory(name: &[u8], dir_ref: DirectoryRef) -> Self {
+    pub fn new(name: &[u8], dir_ref: DirectoryRef, flags: FileFlags) -> Self {
         Self {
             header: DirectoryRecordHeader {
                 len: ((size_of::<DirectoryRecordHeader>() + name.len() + 1) & !1) as u8,
@@ -77,25 +77,7 @@ impl DirectoryRecord {
                 extent: U32LsbMsb::new(dir_ref.offset as u32),
                 data_len: U32LsbMsb::new(dir_ref.size as u32),
                 date_time: DirDateTime::default(),
-                flags: FileFlags::DIRECTORY.bits(),
-                file_unit_size: 0,
-                interleave_gap_size: 0,
-                volume_sequence_number: U16LsbMsb::new(1),
-                file_identifier_len: name.len() as u8,
-            },
-            name: IsoStringFile::from_bytes(name),
-        }
-    }
-
-    pub fn file(name: &[u8], file_ref: DirectoryRef) -> Self {
-        Self {
-            header: DirectoryRecordHeader {
-                len: ((size_of::<DirectoryRecordHeader>() + name.len() + 1) & !1) as u8,
-                extended_attr_record: 0,
-                extent: U32LsbMsb::new(file_ref.offset as u32),
-                data_len: U32LsbMsb::new(file_ref.size as u32),
-                date_time: DirDateTime::default(),
-                flags: FileFlags::empty().bits(),
+                flags: flags.bits(),
                 file_unit_size: 0,
                 interleave_gap_size: 0,
                 volume_sequence_number: U16LsbMsb::new(1),

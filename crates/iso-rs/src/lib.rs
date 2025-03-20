@@ -2,109 +2,28 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     io::{Read, Seek, SeekFrom, Write},
-    path::PathBuf,
 };
 
 use boot::{BootCatalogue, BootInfoTable};
 use directory::{DirectoryRecord, DirectoryRecordHeader, DirectoryRef, FileFlags};
+use file::FileInput;
 use path::PathTableEntry;
-use types::{Endian, IsoStringFile, LittleEndian, U16, U32};
+use types::{Endian, IsoStringFile, U16, U32};
 use volume::{
     BootRecordVolumeDescriptor, PrimaryVolumeDescriptor, VolumeDescriptor, VolumeDescriptorList,
 };
 
 pub mod boot;
 pub mod directory;
+pub mod file;
 pub mod path;
 pub mod types;
 pub mod volume;
 
-#[derive(Clone)]
-pub enum IsoFile {
-    Directory { name: String, entries: Vec<IsoFile> },
-    File { name: String, data: Vec<u8> },
-}
-
-impl Debug for IsoFile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IsoFile::Directory { name, entries } => f
-                .debug_struct("Directory")
-                .field("name", &name)
-                .field("entries", &entries)
-                .finish(),
-            IsoFile::File { name, data } => f
-                .debug_struct("File")
-                .field("name", &name)
-                .field("data_len", &data.len())
-                .finish(),
-        }
-    }
-}
-
-impl IsoFile {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Directory { name, .. } => name,
-            Self::File { name, .. } => name,
-        }
-    }
-
-    pub fn set_name(&mut self, new_name: String) {
-        match self {
-            Self::Directory { name, .. } => *name = new_name,
-            Self::File { name, .. } => *name = new_name,
-        }
-    }
-
-    // TODO: We should probably use some sort of trait for paths, since we are doing a lot of
-    // repeated work here, stripping paths, and then we add it back later in the ISO creation
-    pub fn parse_fs(root: PathBuf) -> Result<IsoFile, std::io::Error> {
-        assert!(root.is_dir());
-        let entries = std::fs::read_dir(&root)?;
-        let mut files = Vec::new();
-        for entry in entries {
-            files.push(Self::parse_fs_recursive(&entry?.path(), &root)?);
-        }
-        Ok(Self::Directory {
-            name: "".to_string(),
-            entries: files,
-        })
-    }
-
-    fn parse_fs_recursive(file: &PathBuf, root: &PathBuf) -> Result<IsoFile, std::io::Error> {
-        if file.is_dir() {
-            let entries = std::fs::read_dir(file)?;
-            let mut files = Vec::new();
-            for entry in entries {
-                files.push(Self::parse_fs_recursive(&entry?.path(), file)?);
-            }
-            Ok(Self::Directory {
-                name: file
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
-                entries: files,
-            })
-        } else {
-            Ok(Self::File {
-                name: file
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
-                data: std::fs::read(file)?,
-            })
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct FormatOptions {
-    pub files: Vec<IsoFile>,
+    pub files: FileInput,
+    pub protective_mbr: bool,
     pub el_torito: Option<ElToritoOptions>,
 }
 
@@ -115,8 +34,6 @@ pub struct ElToritoOptions {
     // The path to the boot image,
     // Currently on root directory is supported
     pub boot_image_path: String,
-    /// The boot image, which is the contents of the boot sector
-    pub boot_image: Vec<u8>,
     /// Whether to write the boot info table, for bootloaders like:
     /// GRUB, LIMINE, SYSLINUX
     pub boot_info_table: bool,
@@ -271,6 +188,16 @@ impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
     pub fn format_new(data: &'a mut T, mut ops: FormatOptions) -> Result<(), std::io::Error> {
         let size_bytes = data.seek(SeekFrom::End(0))?;
         let size_sectors = size_bytes / 2048;
+        log::trace!(
+            "Started formatting ISO image with {} sectors ({}) bytes)",
+            size_sectors,
+            size_bytes
+        );
+
+        if ops.protective_mbr {
+            data.seek(SeekFrom::Start(0))?;
+            data.write_all(bytemuck::bytes_of(&ProtectiveMBR::new(size_sectors as u32)))?;
+        }
 
         let mut volume_descriptors = VolumeDescriptorList::empty();
 
@@ -279,12 +206,19 @@ impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
         )));
 
         if let Some(el_torito) = &ops.el_torito {
+            log::trace!("Adding boot record to volume descriptors");
             volume_descriptors.push(VolumeDescriptor::BootRecord(
                 BootRecordVolumeDescriptor::new(0),
             ));
-            ops.files.push(IsoFile::File {
-                name: el_torito.boot_image_path.clone(),
-                data: el_torito.boot_image.clone(),
+            assert!(
+                ops.files.contains(&el_torito.boot_image_path),
+                "Boot image path not found in files"
+            );
+            log::trace!("Appending boot catalogue to file list");
+            ops.files.append(file::File {
+                path: "boot.catalog".to_string(),
+                // TODO: We need to make this dynamic
+                data: file::FileData::Data(vec![0; 32 * 4]),
             });
         }
 
@@ -296,6 +230,7 @@ impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
         let (root_dir, path_table) = file_writer.write()?;
 
         {
+            log::trace!("Updating primary volume descriptor");
             let pvd = volume_descriptors.primary_mut();
             pvd.dir_record.header.extent.write(root_dir.offset as u32);
             pvd.dir_record.header.data_len.write(root_dir.size as u32);
@@ -305,18 +240,24 @@ impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
                 .set(path_table.offset as u32 + (path_table.size / 2048) as u32);
         }
 
-        if let Some(mut ops) = ops.el_torito {
+        if let Some(ops) = ops.el_torito {
             // TODO: If we support nested files, we need to find them from the Path table, and not
             // the root directory
             let mut root_dir = IsoDirectory {
                 reader: data,
                 directory: root_dir.clone(),
             };
-            let (_idx, file) = root_dir
+            let (_, file) = root_dir
                 .entries()?
                 .iter()
                 .find(|(_idx, e)| e.name.to_str() == ops.boot_image_path.as_str())
                 .expect("Could not find the boot image path in ISO filesystem")
+                .clone();
+            let (_, catalog_file) = root_dir
+                .entries()?
+                .iter()
+                .find(|(_idx, e)| e.name.to_str() == "boot.catalog")
+                .expect("Could not find the boot catalogue in ISO filesystem")
                 .clone();
 
             let current_index = Self::align(data)?;
@@ -324,24 +265,30 @@ impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
             let boot_image_lba = file.header.extent.read();
 
             if ops.boot_info_table {
+                let mut checksum = 0u32;
+                let mut buffer = [0u8; 4];
+                data.seek(SeekFrom::Start(
+                    file.header.extent.read() as u64 * 2048 + 64,
+                ))?;
+                for _ in (64..file.header.data_len.read()).step_by(4) {
+                    data.read_exact(&mut buffer)?;
+                    checksum = checksum.wrapping_add(u32::from_le_bytes(buffer));
+                }
                 let byte_offset = boot_image_lba * 2048;
                 let table = BootInfoTable {
                     iso_start: U32::new(16),
-                    boot_device_number: U16::new(0),
-                    boot_media_type: U16::new(0),
-                    boot_image_lba: U32::new(boot_image_lba),
-                    total_sectors: U32::new(size_sectors as u32),
-                    boot_file_offset: U32::new(boot_image_lba * 2048),
-                    boot_file_size: U32::new(byte_offset),
+                    file_lba: U32::new(file.header.extent.read()),
+                    file_len: U32::new(file.header.data_len.read()),
+                    checksum: U32::new(checksum),
                 };
 
                 const TABLE_OFFSET: u64 = 8;
                 data.seek(SeekFrom::Start(byte_offset as u64 + TABLE_OFFSET))?;
                 data.write_all(bytemuck::bytes_of(&table))?;
-
-                // We need to seek to the file to update the boot info table
-                data.seek(SeekFrom::Start(current_index))?;
             }
+
+            // We need to seek to the file to update the boot info table
+            data.seek(SeekFrom::Start(current_index))?;
 
             let catalogue_start = Self::align(data)? / 2048;
             volume_descriptors
@@ -350,13 +297,20 @@ impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
                 .catalog_ptr
                 .set(catalogue_start as u32);
             // TODO: Allow specification of segment
-            let catalogue = BootCatalogue::new(
+            let catalog = BootCatalogue::new(
                 boot::MediaType::NoEmulation,
                 0x00,
                 ops.load_size,
                 boot_image_lba,
             );
-            catalogue.write(data)?;
+            catalog.write(data)?;
+            Self::align(data)?;
+
+            data.seek(SeekFrom::Start(
+                catalog_file.header.extent.read() as u64 * 2048,
+            ))?;
+            assert!(catalog_file.header.data_len.read() as usize >= catalog.size());
+            catalog.write(data)?;
         }
         Self::align(data)?;
 
@@ -432,31 +386,40 @@ impl<'a, T: ReadWriteSeek> IsoImage<'a, T> {
 struct FileWriter<'a, W: ReadWriteSeek> {
     writer: &'a mut W,
 
-    /// A flat-map of the files
-    files: Vec<IsoFile>,
-    written_files: BTreeMap<String, DirectoryRef>,
+    dirs: Vec<file::File>,
+    files: Vec<file::File>,
+
+    /// The first element is whether the file is a directory
+    written_files: BTreeMap<String, (bool, DirectoryRef)>,
 }
 
 impl<'a, W: ReadWriteSeek> FileWriter<'a, W> {
-    pub fn new(writer: &'a mut W, file_tree: Vec<IsoFile>) -> Self {
-        let mut files = Vec::new();
+    pub fn new(writer: &'a mut W, files: FileInput) -> Self {
+        log::trace!("Started writing files");
+        let (mut dirs, mut files) = files.split();
 
-        Self::flatmap_recursive(
-            &mut files,
-            IsoFile::Directory {
-                name: "".to_string(),
-                entries: file_tree,
-            },
-            "",
-        );
-        // TODO: Optimize algorithm to not require this
-        files.reverse();
+        log::trace!("Sorting directories by depth");
+        Self::sort_by_depth(&mut dirs);
+        Self::sort_by_depth(&mut files);
 
         Self {
             writer,
+
+            dirs,
             files,
+
             written_files: BTreeMap::new(),
         }
+    }
+
+    /// Sorts the files by their depth in the directory tree
+    /// Files with higher depth are written first
+    fn sort_by_depth(files: &mut Vec<file::File>) {
+        files.sort_by(|a, b| {
+            let a_depth = a.path.split('/').count();
+            let b_depth = b.path.split('/').count();
+            a_depth.cmp(&b_depth)
+        });
     }
 
     /// Writes the file data, directory data, and the path table to the given writer, returning a
@@ -469,71 +432,81 @@ impl<'a, W: ReadWriteSeek> FileWriter<'a, W> {
     }
 
     fn write_file_data(&mut self) -> Result<(), std::io::Error> {
+        log::trace!("Started writing file data");
         for file in &self.files {
-            if let IsoFile::File { name, data } = file {
-                let size_aligned = (data.len() + 2047) & !2047;
-                self.written_files.insert(
-                    name.clone(),
+            let data = file.data.get_data();
+            //let size_aligned = (data.len() + 2047) & !2047;
+            self.written_files.insert(
+                file.path.clone(),
+                (
+                    false,
                     DirectoryRef {
                         offset: IsoImage::current_sector(self.writer) as u64,
-                        size: size_aligned as u64,
+                        size: data.len() as u64,
                     },
-                );
-                self.writer.write_all(data)?;
-                IsoImage::align(self.writer)?;
-            }
+                ),
+            );
+            self.writer.write_all(&data)?;
+            IsoImage::align(self.writer)?;
         }
         Ok(())
     }
 
     fn write_directory_data(&mut self) -> Result<DirectoryRef, std::io::Error> {
-        let current_dir_ent = DirectoryRecord::directory(&[0x00], DirectoryRef::default());
-        let parent_dir_ent = DirectoryRecord::directory(&[0x01], DirectoryRef::default());
+        log::trace!("Started writing directory data");
+        let current_dir_ent =
+            DirectoryRecord::new(&[0x00], DirectoryRef::default(), FileFlags::DIRECTORY);
+        let parent_dir_ent =
+            DirectoryRecord::new(&[0x01], DirectoryRef::default(), FileFlags::DIRECTORY);
 
         // In the first pass, we just write all of the directories from the leaves
-        for file in &self.files {
-            if let IsoFile::Directory { name, entries } = file {
-                let start_sector = IsoImage::current_sector(self.writer);
-                // We can just leave these as default, we modify them in a second pass
-                current_dir_ent.write(self.writer)?;
-                parent_dir_ent.write(self.writer)?;
+        for file in &self.dirs {
+            let start_sector = IsoImage::current_sector(self.writer);
+            // We can just leave these as default, we modify them in a second pass
+            current_dir_ent.write(self.writer)?;
+            parent_dir_ent.write(self.writer)?;
 
-                for entry in entries {
-                    let orig_name = entry.name().split('/').last().unwrap();
-                    let file_ref = self.written_files.get(entry.name()).unwrap();
-                    let ent = match entry {
-                        IsoFile::Directory { .. } => {
-                            DirectoryRecord::directory(orig_name.as_bytes(), *file_ref)
-                        }
-                        IsoFile::File { .. } => {
-                            DirectoryRecord::file(orig_name.as_bytes(), *file_ref)
-                        }
-                    };
-                    ent.write(self.writer)?;
-                }
-
-                let end = IsoImage::align(self.writer)?;
-                let directory_ref = DirectoryRef {
-                    offset: start_sector as u64,
-                    size: end - start_sector as u64 * 2048,
+            for entry in file.get_children() {
+                let fullname = if file.path.is_empty() {
+                    entry.to_string()
+                } else {
+                    format!("{}/{}", file.path, entry)
                 };
-                self.written_files.insert(name.clone(), directory_ref);
+                log::trace!("Processing directory record for {}", fullname);
+                let stem = entry.split('/').last().unwrap_or(&entry);
+                let (is_dir, file_ref) = self.written_files.get(&fullname).unwrap();
+                let flags = if *is_dir {
+                    FileFlags::DIRECTORY
+                } else {
+                    FileFlags::empty()
+                };
+                log::trace!("Writing directory record for {}", fullname);
+                DirectoryRecord::new(stem.as_bytes(), *file_ref, flags).write(self.writer)?;
             }
+
+            let end = IsoImage::align(self.writer)?;
+            let directory_ref = DirectoryRef {
+                offset: start_sector as u64,
+                size: end - start_sector as u64 * 2048,
+            };
+            self.written_files
+                .insert(file.path.clone(), (true, directory_ref));
         }
 
         let root_dir = self.written_files.get("").unwrap().clone();
-        let mut stack = vec![(&root_dir, &root_dir, "".to_string())];
+        let mut stack = vec![(root_dir.1, root_dir.1, "".to_string())];
 
         while let Some((dir_ref, parent_ref, cur_path)) = stack.pop() {
             let start = dir_ref.offset * 2048;
             self.writer.seek(SeekFrom::Start(start))?;
 
-            DirectoryRecord::directory(&[0x00], *dir_ref).write(&mut self.writer)?;
-            DirectoryRecord::directory(&[0x01], *parent_ref).write(&mut self.writer)?;
+            DirectoryRecord::new(&[0x00], dir_ref, FileFlags::DIRECTORY).write(&mut self.writer)?;
+            DirectoryRecord::new(&[0x01], parent_ref, FileFlags::DIRECTORY)
+                .write(&mut self.writer)?;
 
             let mut reader = IsoDirectory {
                 reader: self.writer,
-                directory: *dir_ref,
+                directory: dir_ref,
             };
             for (offset, directory) in reader
                 .entries()?
@@ -545,7 +518,7 @@ impl<'a, W: ReadWriteSeek> FileWriter<'a, W> {
                     continue;
                 }
                 let dirname = format!("{}/{}", cur_path, directory.name);
-                let dir_ref_inner = self.written_files.get(dirname.as_str()).unwrap();
+                let dir_ref_inner = self.written_files.get(dirname.as_str()).unwrap().1;
                 let mut new_entry = directory.clone();
                 new_entry.header.extent.write(dir_ref_inner.offset as u32);
                 new_entry.header.data_len.write(dir_ref_inner.size as u32);
@@ -557,15 +530,16 @@ impl<'a, W: ReadWriteSeek> FileWriter<'a, W> {
 
         // We need to seek back to the end of the directory record list, which is the root directory
         self.writer
-            .seek(SeekFrom::Start(root_dir.offset * 2048 + root_dir.size))?;
+            .seek(SeekFrom::Start(root_dir.1.offset * 2048 + root_dir.1.size))?;
 
-        Ok(root_dir)
+        Ok(root_dir.1)
     }
 
     fn write_path_table(
         &mut self,
         root_dir: &DirectoryRef,
     ) -> Result<DirectoryRef, std::io::Error> {
+        log::trace!("Started writing path table");
         let start_sector = IsoImage::current_sector(self.writer);
         let mut entries = Vec::new();
         let mut index = 1; // Root directory is always index 1
@@ -582,28 +556,31 @@ impl<'a, W: ReadWriteSeek> FileWriter<'a, W> {
 
         parent_map.insert("".to_string(), 1);
 
-        for file in &self.files {
-            if let IsoFile::Directory { name, .. } = file {
-                if name.is_empty() {
-                    // We already wrote the root directory
-                    continue;
-                }
-                let directory_ref = self.written_files.get(name).unwrap();
-                let parent_name = name.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-
-                let parent_index = *parent_map.get(parent_name).unwrap_or(&1);
-                parent_map.insert(name.clone(), index);
-
-                entries.push(PathTableEntry {
-                    length: name.len() as u8,
-                    name: name.clone(),
-                    extended_attr_record: 0,
-                    parent_lba: directory_ref.offset as u32,
-                    parent_index,
-                });
-
-                index += 1;
+        for file in &self.dirs {
+            if file.path.is_empty() {
+                // We already wrote the root directory
+                continue;
             }
+            let (_, directory_ref) = self.written_files.get(&file.path).unwrap();
+            let parent_name = file.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+
+            let parent_index = *parent_map.get(parent_name).unwrap_or(&1);
+            parent_map.insert(file.path.clone(), index);
+            let name = file
+                .path
+                .rsplit_once('/')
+                .map(|(_, n)| n)
+                .unwrap_or(&file.path);
+
+            entries.push(PathTableEntry {
+                length: name.len() as u8,
+                name: name.to_string(),
+                extended_attr_record: 0,
+                parent_lba: directory_ref.offset as u32,
+                parent_index,
+            });
+
+            index += 1;
         }
 
         // Write L-Table (Little-Endian)
@@ -633,100 +610,44 @@ impl<'a, W: ReadWriteSeek> FileWriter<'a, W> {
 
         Ok(path_table_ref)
     }
-
-    fn flatmap_recursive(files: &mut Vec<IsoFile>, file: IsoFile, cur_path: &str) {
-        match file {
-            IsoFile::Directory { name, entries } => {
-                let mut path = format!("{}/{}", cur_path, name);
-                if path.ends_with('/') {
-                    path.pop();
-                }
-
-                files.push(IsoFile::Directory {
-                    name: path.clone(),
-                    // We create new entries, with just the name, and no data
-                    entries: entries
-                        .iter()
-                        .map(|e| match e {
-                            IsoFile::File { name, data: _ } => IsoFile::File {
-                                name: format!("{}/{}", path, name),
-                                data: Vec::new(),
-                            },
-                            IsoFile::Directory { name, entries: _ } => IsoFile::Directory {
-                                name: format!("{}/{}", path, name),
-                                entries: Vec::new(),
-                            },
-                        })
-                        .collect(),
-                });
-                for entry in entries {
-                    Self::flatmap_recursive(files, entry, &path);
-                }
-            }
-            IsoFile::File { name, data } => {
-                let mut path = format!("{}/{}", cur_path, name);
-                if path.ends_with('/') {
-                    path.pop();
-                }
-                files.push(IsoFile::File { name: path, data });
-            }
-        }
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct ProtectiveMBR {
+    boot_code: [u8; 446],      // Empty or boot code
+    partition_entry: [u8; 16], // Protective Partition
+    reserved: [u8; 48],        // Unused
+    boot_signature: [u8; 2],   // Must be [0x55, 0xAA]
+}
 
-    #[test]
-    fn test_parse_fs() {
-        let root = tempfile::tempdir().unwrap();
-        let root_path = root.path();
-        let boot_dir = root_path.join("BOOT/GRUB");
-        let efi_dir = root_path.join("EFI");
-        std::fs::create_dir_all(&boot_dir).unwrap();
-        std::fs::create_dir_all(&efi_dir).unwrap();
-        let grub_cfg = boot_dir.join("grub.cfg");
-        std::fs::write(&grub_cfg, "test").unwrap();
-        let efi_cfg = efi_dir.join("BOOTX64.efi");
-        std::fs::write(&efi_cfg, "test2").unwrap();
+unsafe impl bytemuck::Zeroable for ProtectiveMBR {}
+unsafe impl bytemuck::Pod for ProtectiveMBR {}
 
-        let fs = IsoFile::parse_fs(root.into_path()).unwrap();
-        match fs {
-            IsoFile::Directory { name: _, entries } => {
-                assert_eq!(entries.len(), 2);
-                let boot_entry = entries.iter().find(|e| e.name() == "BOOT").unwrap();
-                let grub_entry = match boot_entry {
-                    IsoFile::Directory { name: _, entries } => {
-                        entries.iter().find(|e| e.name() == "GRUB").unwrap()
-                    }
-                    _ => panic!("unexpected fs type"),
-                };
-                let grub_cfg = match grub_entry {
-                    IsoFile::Directory { name: _, entries } => {
-                        entries.iter().find(|e| e.name() == "grub.cfg").unwrap()
-                    }
-                    _ => panic!("unexpected fs type"),
-                };
-                let data = match grub_cfg {
-                    IsoFile::File { name: _, data } => data,
-                    _ => panic!("unexpected fs type"),
-                };
-                assert_eq!(data, b"test");
-                let efi_entry = entries.iter().find(|e| e.name() == "EFI").unwrap();
-                let efi_boot = match efi_entry {
-                    IsoFile::Directory { name: _, entries } => {
-                        entries.iter().find(|e| e.name() == "BOOTX64.efi").unwrap()
-                    }
-                    _ => panic!("unexpected fs type"),
-                };
-                let efi_data = match efi_boot {
-                    IsoFile::File { name: _, data } => data,
-                    _ => panic!("unexpected fs type"),
-                };
-                assert_eq!(efi_data, b"test2");
-            }
-            _ => panic!("unexpected fs type"),
+impl ProtectiveMBR {
+    pub fn new(total_sectors: u32) -> Self {
+        ProtectiveMBR {
+            boot_code: [0; 446],
+            partition_entry: [
+                0x00,
+                0xFF,
+                0xFF,
+                0xFF, // Status & CHS Start
+                0x17, // Partition Type (Hidden NTFS / ISO)
+                0xFF,
+                0xFF,
+                0xFF, // CHS End
+                0x01,
+                0x00,
+                0x00,
+                0x00, // LBA Start (1 sector after MBR)
+                (total_sectors & 0xFF) as u8,
+                ((total_sectors >> 8) & 0xFF) as u8,
+                ((total_sectors >> 16) & 0xFF) as u8,
+                ((total_sectors >> 24) & 0xFF) as u8,
+            ],
+            reserved: [0; 48],
+            boot_signature: [0x55, 0xAA],
         }
     }
 }

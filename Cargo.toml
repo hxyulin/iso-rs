@@ -16,3 +16,4 @@ categories = ["filesystem", "encoding"]
 
 [workspace.dependencies]
 iso9660-rs = { path = "crates/iso-rs", version = "0.0.1-alpha" }
+log = "0.4.26"

@@ -100,6 +100,20 @@ impl BootCatalogue {
         writer.write_all(&[0; 32])?;
         Ok(())
     }
+
+    pub fn size(&self) -> usize {
+        // 32 for the validation entry
+        // 32 for the default entry
+        // For each section:
+        // 32 for header
+        // and 32 for each entry
+        64 + self
+            .sections
+            .iter()
+            .map(|(_, entries)| entries.len() + 1)
+            .sum::<usize>()
+            * 32
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -351,12 +365,9 @@ unsafe impl bytemuck::Pod for BootSectionEntryExtension {}
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
 pub struct BootInfoTable {
     pub iso_start: U32<LittleEndian>,
-    pub boot_device_number: U16<LittleEndian>,
-    pub boot_media_type: U16<LittleEndian>,
-    pub boot_image_lba: U32<LittleEndian>,
-    pub total_sectors: U32<LittleEndian>,
-    pub boot_file_offset: U32<LittleEndian>,
-    pub boot_file_size: U32<LittleEndian>,
+    pub file_lba: U32<LittleEndian>,
+    pub file_len: U32<LittleEndian>,
+    pub checksum: U32<LittleEndian>,
 }
 
 #[cfg(test)]
